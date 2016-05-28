@@ -7,7 +7,6 @@
 #include <sstream>
 #include <stdlib.h>
 
-
 struct : public arg_t {
   std::string to_string(insn_t insn) const {
     return std::to_string((int)insn.i_imm()) + '(' + xpr_name[insn.rs1()] + ')';
@@ -22,7 +21,7 @@ struct : public arg_t {
 
 struct : public arg_t {
   std::string to_string(insn_t insn) const {
-    return std::string("0(") + xpr_name[insn.rs1()] + ')';
+    return std::string("(") + xpr_name[insn.rs1()] + ')';
   }
 } amo_address;
 
@@ -143,12 +142,6 @@ struct : public arg_t {
     return xpr_name[insn.rvc_rs2s()];
   }
 } rvc_rs2s;
-
-struct : public arg_t {
-  std::string to_string(insn_t insn) const {
-    return xpr_name[insn.rvc_rds()];
-  }
-} rvc_rds;
 
 struct : public arg_t {
   std::string to_string(insn_t insn) const {
@@ -416,8 +409,12 @@ disassembler_t::disassembler_t()
   DEFINE_RTYPE(remw);
   DEFINE_RTYPE(remuw);
 
-  DEFINE_NOARG(scall);
-  DEFINE_NOARG(sbreak);
+  DEFINE_NOARG(ecall);
+  DEFINE_NOARG(ebreak);
+  DEFINE_NOARG(uret);
+  DEFINE_NOARG(sret);
+  DEFINE_NOARG(hret);
+  DEFINE_NOARG(mret);
   DEFINE_NOARG(fence);
   DEFINE_NOARG(fence_i);
 
@@ -434,7 +431,6 @@ disassembler_t::disassembler_t()
   add_insn(new disasm_insn_t("csrrwi", match_csrrwi, mask_csrrwi, {&xrd, &csr, &zimm5}));
   add_insn(new disasm_insn_t("csrrsi", match_csrrsi, mask_csrrsi, {&xrd, &csr, &zimm5}));
   add_insn(new disasm_insn_t("csrrci", match_csrrci, mask_csrrci, {&xrd, &csr, &zimm5}));
-  DEFINE_NOARG(sret)
 
   DEFINE_FRTYPE(fadd_s);
   DEFINE_FRTYPE(fsub_s);
@@ -503,24 +499,29 @@ disassembler_t::disassembler_t()
   DISASM_INSN("jr", c_li, mask_rvc_imm, {&rvc_rs1});
   DISASM_INSN("jalr", c_lui, mask_rvc_imm, {&rvc_rs1});
   DISASM_INSN("nop", c_addi, mask_rd | mask_rvc_imm, {});
-  DISASM_INSN("addi", c_addi, mask_rd, {&rvc_sp, &rvc_sp, &rvc_addi16sp_imm});
+  DISASM_INSN("addi", c_addi16sp, mask_rd, {&rvc_sp, &rvc_sp, &rvc_addi16sp_imm});
   DISASM_INSN("addi", c_addi4spn, 0, {&rvc_rs1s, &rvc_sp, &rvc_addi4spn_imm});
   DISASM_INSN("li", c_li, 0, {&xrd, &rvc_imm});
   DISASM_INSN("lui", c_lui, 0, {&xrd, &rvc_uimm});
   DISASM_INSN("addi", c_addi, 0, {&xrd, &xrd, &rvc_imm});
   DISASM_INSN("addiw", c_addiw, 0, {&xrd, &xrd, &rvc_imm});
   DISASM_INSN("slli", c_slli, 0, {&xrd, &rvc_shamt});
-  DISASM_INSN("mv", c_mv, 0, {&xrd, &rvc_rs1});
-  DISASM_INSN("add", c_add, 0, {&xrd, &xrd, &rvc_rs1});
-  DISASM_INSN("addw", c_addw, 0, {&xrd, &xrd, &rvc_rs1});
+  DISASM_INSN("mv", c_mv, 0, {&xrd, &rvc_rs2});
+  DISASM_INSN("add", c_add, 0, {&xrd, &xrd, &rvc_rs2});
+  DISASM_INSN("addw", c_addw, 0, {&rvc_rs1s, &rvc_rs1s, &rvc_rs2s});
+  DISASM_INSN("sub", c_sub, 0, {&rvc_rs1s, &rvc_rs1s, &rvc_rs2s});
+  DISASM_INSN("subw", c_subw, 0, {&rvc_rs1s, &rvc_rs1s, &rvc_rs2s});
+  DISASM_INSN("and", c_and, 0, {&rvc_rs1s, &rvc_rs1s, &rvc_rs2s});
+  DISASM_INSN("or", c_or, 0, {&rvc_rs1s, &rvc_rs1s, &rvc_rs2s});
+  DISASM_INSN("xor", c_xor, 0, {&rvc_rs1s, &rvc_rs1s, &rvc_rs2s});
   DISASM_INSN("lw", c_lwsp, 0, {&xrd, &rvc_lwsp_address});
-  DISASM_INSN("ld", c_ldsp, 0, {&xrd, &rvc_ldsp_address});
+  DISASM_INSN("flw", c_flwsp, 0, {&xrd, &rvc_lwsp_address});
   DISASM_INSN("sw", c_swsp, 0, {&rvc_rs2, &rvc_swsp_address});
-  DISASM_INSN("sd", c_sdsp, 0, {&rvc_rs2, &rvc_sdsp_address});
+  DISASM_INSN("fsw", c_fswsp, 0, {&rvc_rs2, &rvc_swsp_address});
   DISASM_INSN("lw", c_lw, 0, {&rvc_rs2s, &rvc_lw_address});
-  DISASM_INSN("ld", c_ld, 0, {&rvc_rs2s, &rvc_ld_address});
+  DISASM_INSN("flw", c_flw, 0, {&rvc_rs2s, &rvc_lw_address});
   DISASM_INSN("sw", c_sw, 0, {&rvc_rs2s, &rvc_lw_address});
-  DISASM_INSN("sd", c_sd, 0, {&rvc_rs2s, &rvc_ld_address});
+  DISASM_INSN("fsw", c_fsw, 0, {&rvc_rs2s, &rvc_lw_address});
   DISASM_INSN("beqz", c_beqz, 0, {&rvc_rs1s, &rvc_branch_target});
   DISASM_INSN("bnez", c_bnez, 0, {&rvc_rs1s, &rvc_branch_target});
   DISASM_INSN("j", c_j, 0, {&rvc_jump_target});

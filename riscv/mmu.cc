@@ -4,8 +4,8 @@
 #include "sim.h"
 #include "processor.h"
 
-mmu_t::mmu_t(char* _mem, size_t _memsz)
- : mem(_mem), memsz(_memsz), proc(NULL)
+mmu_t::mmu_t(sim_t* sim, processor_t* proc)
+ : sim(sim), proc(proc)
 {
   flush_tlb();
 }
@@ -29,58 +29,86 @@ void mmu_t::flush_tlb()
   flush_icache();
 }
 
-void* mmu_t::refill_tlb(reg_t addr, reg_t bytes, bool store, bool fetch)
+reg_t mmu_t::translate(reg_t addr, access_type type)
 {
-  reg_t idx = (addr >> PGSHIFT) % TLB_ENTRIES;
-  reg_t expected_tag = addr >> PGSHIFT;
+  if (!proc)
+    return addr;
 
-  reg_t pgbase;
-  if (unlikely(!proc)) {
-    pgbase = addr & -PGSIZE;
-  } else {
-    reg_t mode = get_field(proc->state.mstatus, MSTATUS_PRV);
-    if (!fetch && get_field(proc->state.mstatus, MSTATUS_MPRV))
-      mode = get_field(proc->state.mstatus, MSTATUS_PRV1);
-    if (get_field(proc->state.mstatus, MSTATUS_VM) == VM_MBARE)
-      mode = PRV_M;
-  
-    if (mode == PRV_M) {
-      reg_t msb_mask = (reg_t(2) << (proc->xlen-1))-1; // zero-extend from xlen
-      pgbase = addr & -PGSIZE & msb_mask;
-    } else {
-      pgbase = walk(addr, mode > PRV_U, store, fetch);
-    }
+  reg_t mode = proc->state.prv;
+  bool pum = false;
+  if (type != FETCH) {
+    if (get_field(proc->state.mstatus, MSTATUS_MPRV))
+      mode = get_field(proc->state.mstatus, MSTATUS_MPP);
+    pum = (mode == PRV_S && get_field(proc->state.mstatus, MSTATUS_PUM));
   }
+  if (get_field(proc->state.mstatus, MSTATUS_VM) == VM_MBARE)
+    mode = PRV_M;
 
-  reg_t pgoff = addr & (PGSIZE-1);
-  reg_t paddr = pgbase + pgoff;
-
-  if (pgbase >= memsz) {
-    if (fetch) throw trap_instruction_access_fault(addr);
-    else if (store) throw trap_store_access_fault(addr);
-    else throw trap_load_access_fault(addr);
+  if (mode == PRV_M) {
+    reg_t msb_mask = (reg_t(2) << (proc->xlen-1))-1; // zero-extend from xlen
+    return addr & msb_mask;
   }
-
-  bool trace = tracer.interested_in_range(pgbase, pgbase + PGSIZE, store, fetch);
-  if (unlikely(!fetch && trace))
-    tracer.trace(paddr, bytes, store, fetch);
-  else
-  {
-    if (tlb_load_tag[idx] != expected_tag) tlb_load_tag[idx] = -1;
-    if (tlb_store_tag[idx] != expected_tag) tlb_store_tag[idx] = -1;
-    if (tlb_insn_tag[idx] != expected_tag) tlb_insn_tag[idx] = -1;
-
-    if (fetch) tlb_insn_tag[idx] = expected_tag;
-    else if (store) tlb_store_tag[idx] = expected_tag;
-    else tlb_load_tag[idx] = expected_tag;
-
-    tlb_data[idx] = mem + pgbase - (addr & -PGSIZE);
-  }
-
-  return mem + paddr;
+  return walk(addr, type, mode > PRV_U, pum) | (addr & (PGSIZE-1));
 }
 
-reg_t mmu_t::walk(reg_t addr, bool supervisor, bool store, bool fetch)
+const uint16_t* mmu_t::fetch_slow_path(reg_t addr)
+{
+  reg_t paddr = translate(addr, FETCH);
+  if (sim->addr_is_mem(paddr)) {
+    refill_tlb(addr, paddr, FETCH);
+    return (const uint16_t*)sim->addr_to_mem(paddr);
+  } else {
+    if (!sim->mmio_load(paddr, sizeof fetch_temp, (uint8_t*)&fetch_temp))
+      throw trap_instruction_access_fault(addr);
+    return &fetch_temp;
+  }
+}
+
+void mmu_t::load_slow_path(reg_t addr, reg_t len, uint8_t* bytes)
+{
+  reg_t paddr = translate(addr, LOAD);
+  if (sim->addr_is_mem(paddr)) {
+    memcpy(bytes, sim->addr_to_mem(paddr), len);
+    if (tracer.interested_in_range(paddr, paddr + PGSIZE, LOAD))
+      tracer.trace(paddr, len, LOAD);
+    else
+      refill_tlb(addr, paddr, LOAD);
+  } else if (!sim->mmio_load(paddr, len, bytes)) {
+    throw trap_load_access_fault(addr);
+  }
+}
+
+void mmu_t::store_slow_path(reg_t addr, reg_t len, const uint8_t* bytes)
+{
+  reg_t paddr = translate(addr, STORE);
+  if (sim->addr_is_mem(paddr)) {
+    memcpy(sim->addr_to_mem(paddr), bytes, len);
+    if (tracer.interested_in_range(paddr, paddr + PGSIZE, STORE))
+      tracer.trace(paddr, len, STORE);
+    else
+      refill_tlb(addr, paddr, STORE);
+  } else if (!sim->mmio_store(paddr, len, bytes)) {
+    throw trap_store_access_fault(addr);
+  }
+}
+
+void mmu_t::refill_tlb(reg_t vaddr, reg_t paddr, access_type type)
+{
+  reg_t idx = (vaddr >> PGSHIFT) % TLB_ENTRIES;
+  reg_t expected_tag = vaddr >> PGSHIFT;
+
+  if (tlb_load_tag[idx] != expected_tag) tlb_load_tag[idx] = -1;
+  if (tlb_store_tag[idx] != expected_tag) tlb_store_tag[idx] = -1;
+  if (tlb_insn_tag[idx] != expected_tag) tlb_insn_tag[idx] = -1;
+
+  if (type == FETCH) tlb_insn_tag[idx] = expected_tag;
+  else if (type == STORE) tlb_store_tag[idx] = expected_tag;
+  else tlb_load_tag[idx] = expected_tag;
+
+  tlb_data[idx] = sim->addr_to_mem(paddr) - vaddr;
+}
+
+reg_t mmu_t::walk(reg_t addr, access_type type, bool supervisor, bool pum)
 {
   int levels, ptidxbits, ptesize;
   switch (get_field(proc->get_state()->mstatus, MSTATUS_VM))
@@ -98,36 +126,32 @@ reg_t mmu_t::walk(reg_t addr, bool supervisor, bool store, bool fetch)
   if (masked_msbs != 0 && masked_msbs != mask)
     return -1;
 
-  reg_t base = proc->get_state()->sptbr;
+  reg_t base = proc->get_state()->sptbr << PGSHIFT;
   int ptshift = (levels - 1) * ptidxbits;
   for (int i = 0; i < levels; i++, ptshift -= ptidxbits) {
     reg_t idx = (addr >> (PGSHIFT + ptshift)) & ((1 << ptidxbits) - 1);
 
     // check that physical address of PTE is legal
     reg_t pte_addr = base + idx * ptesize;
-    if (pte_addr >= memsz)
+    if (!sim->addr_is_mem(pte_addr))
       break;
 
-    void* ppte = mem + pte_addr;
+    void* ppte = sim->addr_to_mem(pte_addr);
     reg_t pte = ptesize == 4 ? *(uint32_t*)ppte : *(uint64_t*)ppte;
     reg_t ppn = pte >> PTE_PPN_SHIFT;
 
     if (PTE_TABLE(pte)) { // next level of page table
       base = ppn << PGSHIFT;
-    } else if (!PTE_CHECK_PERM(pte, supervisor, store, fetch)) {
+    } else if (pum && PTE_CHECK_PERM(pte, 0, type == STORE, type == FETCH)) {
+      break;
+    } else if (!PTE_CHECK_PERM(pte, supervisor, type == STORE, type == FETCH)) {
       break;
     } else {
       // set referenced and possibly dirty bits.
-      *(uint32_t*)ppte |= PTE_R | (store * PTE_D);
+      *(uint32_t*)ppte |= PTE_R | ((type == STORE) * PTE_D);
       // for superpage mappings, make a fake leaf PTE for the TLB's benefit.
       reg_t vpn = addr >> PGSHIFT;
-      reg_t addr = (ppn | (vpn & ((reg_t(1) << ptshift) - 1))) << PGSHIFT;
-
-      // check that physical address is legal
-      if (addr >= memsz)
-        break;
-
-      return addr;
+      return (ppn | (vpn & ((reg_t(1) << ptshift) - 1))) << PGSHIFT;
     }
   }
 
